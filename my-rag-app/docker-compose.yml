@@ -1,0 +1,12 @@
+services:
+  rag-demo:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./vectorstore:/app/vectorstore
+    env_file:
+      - .env
+    # Applies with plain `docker compose up` (not only Swarm)
+    mem_limit: 8g
+    cpus: 4.0

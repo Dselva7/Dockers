@@ -1,0 +1,15 @@
+# torch: install CPU wheels in Dockerfile before this file (see Dockerfile)
+streamlit>=1.32.0
+# langchain-classic hosts create_*_chain APIs; it needs langchain-core 1.2+
+langchain>=0.3.0
+langchain-classic>=1.0.0,<2
+langchain-community>=0.3.0
+langchain-core>=1.2.19,<3
+langchain-text-splitters>=1.1.1,<2
+langchain-openai>=0.2.0
+langchain-groq>=0.2.0
+langchain-huggingface>=0.0.3
+faiss-cpu>=1.8.0
+pypdf>=4.1.0
+python-dotenv>=1.0.1
+sentence-transformers>=2.5.1

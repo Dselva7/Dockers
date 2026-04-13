@@ -1,0 +1,136 @@
+import os
+import tempfile
+import time
+
+import streamlit as st
+from dotenv import load_dotenv
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+load_dotenv()
+
+st.set_page_config(page_title="Architect RAG Demo", page_icon="🤖")
+st.title("Enterprise PDF Intelligence 📚")
+
+model_provider = st.sidebar.selectbox("LLM Provider", ["groq", "openai"])
+
+
+def get_llm(provider: str):
+    if provider == "openai":
+        return ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+    return ChatGroq(model="llama3-70b-8192", temperature=0.1)
+
+
+def uploads_signature(uploads):
+    def _size(f):
+        s = getattr(f, "size", None)
+        return s if s is not None else len(f.getvalue())
+
+    return tuple((f.name, _size(f)) for f in uploads)
+
+
+def config_retriever(uploads):
+    docs = []
+    temp_dir = tempfile.TemporaryDirectory()
+    for file in uploads:
+        temp_filepath = os.path.join(temp_dir.name, file.name)
+        with open(temp_filepath, "wb") as f:
+            f.write(file.getvalue())
+        loader = PyPDFLoader(temp_filepath)
+        docs.extend(loader.load())
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(docs)
+
+    # CPU-only inside Docker (avoids CUDA/MPS driver assumptions in the container)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    vectorstore = FAISS.from_documents(splits, embeddings)
+    os.makedirs("vectorstore", exist_ok=True)
+    vectorstore.save_local("vectorstore/db_faiss")
+    return vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 3, "fetch_k": 4})
+
+
+def config_rag_chain(llm, retriever):
+    context_q_system_prompt = (
+        "Given chat history and a follow-up, make it a standalone question. "
+        "Do NOT answer, just reformulate."
+    )
+    context_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", context_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+    history_aware_retriever = create_history_aware_retriever(llm, retriever, context_q_prompt)
+
+    qa_prompt_template = """You are a helpful assistant. Use the context to answer.
+If you don't know, say so. Keep it concise.
+Context: {context}
+Question: {input}"""
+
+    qa_prompt = PromptTemplate.from_template(qa_prompt_template)
+    qa_chain = create_stuff_documents_chain(llm, qa_prompt)
+
+    return create_retrieval_chain(history_aware_retriever, qa_chain)
+
+
+uploads = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+
+if not uploads:
+    st.info("Awaiting document upload...")
+    st.stop()
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = [
+        AIMessage(content="System Ready. How can I assist with your documents?"),
+    ]
+
+sig = uploads_signature(uploads)
+if "retriever" not in st.session_state or st.session_state.get("uploads_sig") != sig:
+    with st.spinner("Indexing documents (CPU embeddings)..."):
+        st.session_state.retriever = config_retriever(uploads)
+        st.session_state.uploads_sig = sig
+
+for msg in st.session_state.chat_history:
+    st.chat_message("AI" if isinstance(msg, AIMessage) else "Human").write(msg.content)
+
+user_query = st.chat_input("Ask a question about your files...")
+
+if user_query:
+    start = time.time()
+    st.session_state.chat_history.append(HumanMessage(content=user_query))
+    st.chat_message("Human").write(user_query)
+
+    with st.chat_message("AI"):
+        llm = get_llm(model_provider)
+        rag_chain = config_rag_chain(llm, st.session_state.retriever)
+
+        response = rag_chain.invoke(
+            {"input": user_query, "chat_history": st.session_state.chat_history}
+        )
+        full_answer = response["answer"]
+        st.write(full_answer)
+
+        with st.popover("View Evidence"):
+            for doc in response["context"]:
+                page = doc.metadata.get("page", "?")
+                st.caption(f"File: {os.path.basename(doc.metadata['source'])} | Page: {page}")
+                st.write(doc.page_content)
+                st.divider()
+
+    st.session_state.chat_history.append(AIMessage(content=full_answer))
+    print("Generation time (s):", time.time() - start)
